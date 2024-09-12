@@ -29,13 +29,12 @@ from scipy.spatial.transform import Rotation as R
 Hyper parameters
 """
 GROUNDING_MODEL = "IDEA-Research/grounding-dino-base"
-TEXT_PROMPT = "small red cube ."
+OBJECT = "small red cube ."
+TARGET = "basket ."
 SAM2_CHECKPOINT = "./checkpoints/sam2_hiera_large.pt"
 SAM2_MODEL_CONFIG = "sam2_hiera_l.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-OUTPUT_DIR = Path("outputs/my_demo")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSING_INTERVAL_SEC = 2.0  # Processing interval to throttle image processing
+PROCESSING_INTERVAL_SEC = 5.0  # Processing interval to throttle image processing
 
 class ImageProcessor(Node):
     def __init__(self):
@@ -79,10 +78,13 @@ class ImageProcessor(Node):
         self.processor = AutoProcessor.from_pretrained(GROUNDING_MODEL)
         self.grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_MODEL).to(DEVICE)
 
+        # Flag to alternate between processing OBJECT and TARGET
+        self.is_processing_object = True
+        self.object_detected = False
+
     def camera_info_callback(self, msg: CameraInfo):
         """Callback function for camera info topic."""
         self.camera_info = msg
-        # self.get_logger().info(f"Camera Info received. Width: {msg.width}, Height: {msg.height}")
 
     def get_intrinsic_from_camera_info(self):
         """Extract camera intrinsic parameters from the CameraInfo message."""
@@ -104,19 +106,15 @@ class ImageProcessor(Node):
 
         while (self.get_clock().now() - start_time).nanoseconds * 1e-9 < timeout_sec:
             try:
-                # Try to lookup the transformation
                 transform: TransformStamped = self.tf_buffer.lookup_transform(
                     'RGBDCamera5', 'panda_link0', rclpy.time.Time())
 
-                # Extract rotation (quaternion) and translation from the transform
                 translation = transform.transform.translation
                 rotation = transform.transform.rotation
 
-                # Convert quaternion to rotation matrix
                 quaternion = [rotation.x, rotation.y, rotation.z, rotation.w]
                 rotation_matrix = R.from_quat(quaternion).as_matrix()
 
-                # Create the extrinsic matrix (4x4)
                 extrinsic_matrix = np.eye(4)
                 extrinsic_matrix[0:3, 0:3] = rotation_matrix
                 extrinsic_matrix[0:3, 3] = [translation.x, translation.y, translation.z]
@@ -125,8 +123,6 @@ class ImageProcessor(Node):
 
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
                 self.get_logger().warn('TF lookup failed, retrying...')
-                # Wait for retry_interval_sec seconds before retrying
-                rclpy.sleep(retry_interval_sec)
 
         self.get_logger().error(f"TF lookup failed after {timeout_sec} seconds.")
         return None
@@ -146,46 +142,46 @@ class ImageProcessor(Node):
 
     def process_images(self):
         """Process the color and depth images for object detection and point cloud generation."""
-        # Grounding DINO inference
-        image_pil = Image.fromarray(self.color_image)
-        image_pil = image_pil.convert("RGB")
-
-        # Get the intrinsic parameters from camera info
+        image_pil = Image.fromarray(self.color_image).convert("RGB")
         panda_intrinsic = self.get_intrinsic_from_camera_info()
         if panda_intrinsic is None:
             self.get_logger().warn("Camera intrinsic parameters not available.")
             return
 
-        # Get the extrinsic parameters from TF
         extrinsic = self.get_extrinsic_from_tf()
 
-        # environment settings
         torch.autocast(device_type=DEVICE, dtype=torch.float16).__enter__()
 
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-        # setup the input image and text prompt for SAM 2 and Grounding DINO
-        text = TEXT_PROMPT
+        # Determine if processing OBJECT or TARGET based on the flag
+        if self.is_processing_object:
+            text = OBJECT
+        else:
+            if not self.object_detected:
+                self.get_logger().info("Skipping TARGET processing because no OBJECT was detected.")
+                self.is_processing_object = not self.is_processing_object  # Switch back to OBJECT
+                return
+            text = TARGET
 
-        image = image_pil
         with torch.no_grad():
-            self.sam2_predictor.set_image(np.array(image.convert("RGB")))
+            self.sam2_predictor.set_image(np.array(image_pil))
 
-            inputs = self.processor(images=image, text=text, return_tensors="pt").to(DEVICE)
-        
+            inputs = self.processor(images=image_pil, text=text, return_tensors="pt").to(DEVICE)
             outputs = self.grounding_model(**inputs)
 
             results = self.processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
-                box_threshold=0.4,
-                text_threshold=0.3,
-                target_sizes=[image.size[::-1]]
+                box_threshold=0.5,
+                text_threshold=0.7,
+                target_sizes=[image_pil.size[::-1]]
             )
 
             input_boxes = results[0]["boxes"].cpu().numpy()
+
         if len(input_boxes) > 0:
             masks, scores, logits = self.sam2_predictor.predict(
                 point_coords=None,
@@ -197,7 +193,6 @@ class ImageProcessor(Node):
             if masks.ndim == 4:
                 masks = masks.squeeze(1)
 
-            # Visualize and process image
             detections = sv.Detections(
                 xyxy=input_boxes,
                 mask=masks.astype(bool),
@@ -208,7 +203,6 @@ class ImageProcessor(Node):
             for mask in detections.mask:
                 masked_depth_image[mask] = self.depth_image[mask]
 
-            # Generate the point cloud using the intrinsic and extrinsic parameters
             pcd = o3d.geometry.PointCloud.create_from_depth_image(
                 o3d.geometry.Image(masked_depth_image), panda_intrinsic, extrinsic
             )
@@ -217,18 +211,37 @@ class ImageProcessor(Node):
             _, ind = pcd.remove_statistical_outlier(nb_neighbors=5, std_ratio=2.0)
             filtered_pcd = pcd.select_by_index(ind)
 
-            # Calculate centroid
             points = np.asarray(filtered_pcd.points)
-            centroid = np.mean(points, axis=0)
-            centroid[2] += 0.1  # Added a small offset to the z-coordinate to prevent hitting the object by the gripper
 
-            # Publish centroid
-            self.publish_centroid(centroid)
-            del inputs, outputs, results, masks, scores, logits, input_boxes
+            if self.is_processing_object:
+                # Calculate full 3D centroid for OBJECT
+                centroid = np.mean(points, axis=0)
+                centroid[2] += 0.1  # Added a small offset to prevent gripper collision
+                self.get_logger().info(f'Calculated 3D centroid for OBJECT: {centroid}')
+                self.object_detected = True
+                gripper_state = 0.0
+            else:
+                # Calculate central point in XY plane and highest Z point for TARGET
+                xy_center = np.mean(points[:, :2], axis=0)  # Mean of x and y coordinates
+                max_z = np.max(points[:, 2])  # Maximum of z coordinates
+                centroid = np.array([xy_center[0], xy_center[1], max_z + 0.2])
+                self.get_logger().info(f'Calculated central XY and highest Z for TARGET: {centroid}')
+                gripper_state = 1.0
+            z = 0.0
+            state = np.array([centroid[0], centroid[1], centroid[2], z, gripper_state])
+            # Publish the calculated centroid
+            self.publish_state(state)
+            o3d.visualization.draw_geometries([filtered_pcd])
         else:
-            self.get_logger().info("No detections found.")
+            if self.is_processing_object:
+                # If no OBJECT was found, set object_detected to False
+                self.object_detected = False
+            self.get_logger().info(f"No detections found for {text}.")
 
-    def publish_centroid(self, centroid):
+        # Toggle the flag to alternate between OBJECT and TARGET
+        self.is_processing_object = not self.is_processing_object
+
+    def publish_state(self, centroid):
         msg = Float32MultiArray()
         msg.data = list(centroid)
         self.publisher.publish(msg)
