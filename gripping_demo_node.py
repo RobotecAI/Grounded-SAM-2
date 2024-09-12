@@ -20,6 +20,10 @@ from builtin_interfaces.msg import Time
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import CameraInfo
+import tf2_ros
+import tf2_geometry_msgs
+from geometry_msgs.msg import TransformStamped
+from scipy.spatial.transform import Rotation as R
 
 """
 Hyper parameters
@@ -64,6 +68,10 @@ class ImageProcessor(Node):
         self.camera_info = None
         self.last_processed_time = self.get_clock().now()
 
+        # tf2 listener for extrinsic matrix
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         # SAM2 and Grounding DINO setup
         self.sam2_model = build_sam2(SAM2_MODEL_CONFIG, SAM2_CHECKPOINT, device=DEVICE)
         self.sam2_predictor = SAM2ImagePredictor(self.sam2_model)
@@ -74,6 +82,7 @@ class ImageProcessor(Node):
     def camera_info_callback(self, msg: CameraInfo):
         """Callback function for camera info topic."""
         self.camera_info = msg
+        # self.get_logger().info(f"Camera Info received. Width: {msg.width}, Height: {msg.height}")
 
     def get_intrinsic_from_camera_info(self):
         """Extract camera intrinsic parameters from the CameraInfo message."""
@@ -88,6 +97,39 @@ class ImageProcessor(Node):
         cy = self.camera_info.k[5]  # Principal point y
         
         return o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+
+    def get_extrinsic_from_tf(self, timeout_sec=10.0, retry_interval_sec=0.5):
+        """Get the extrinsic matrix from the TF transform between camera and robot with retry logic."""
+        start_time = self.get_clock().now()
+
+        while (self.get_clock().now() - start_time).nanoseconds * 1e-9 < timeout_sec:
+            try:
+                # Try to lookup the transformation
+                transform: TransformStamped = self.tf_buffer.lookup_transform(
+                    'RGBDCamera5', 'panda_link0', rclpy.time.Time())
+
+                # Extract rotation (quaternion) and translation from the transform
+                translation = transform.transform.translation
+                rotation = transform.transform.rotation
+
+                # Convert quaternion to rotation matrix
+                quaternion = [rotation.x, rotation.y, rotation.z, rotation.w]
+                rotation_matrix = R.from_quat(quaternion).as_matrix()
+
+                # Create the extrinsic matrix (4x4)
+                extrinsic_matrix = np.eye(4)
+                extrinsic_matrix[0:3, 0:3] = rotation_matrix
+                extrinsic_matrix[0:3, 3] = [translation.x, translation.y, translation.z]
+
+                return extrinsic_matrix
+
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                self.get_logger().warn('TF lookup failed, retrying...')
+                # Wait for retry_interval_sec seconds before retrying
+                rclpy.sleep(retry_interval_sec)
+
+        self.get_logger().error(f"TF lookup failed after {timeout_sec} seconds.")
+        return None
 
     def color_callback(self, msg):
         current_time = self.get_clock().now()
@@ -113,6 +155,9 @@ class ImageProcessor(Node):
         if panda_intrinsic is None:
             self.get_logger().warn("Camera intrinsic parameters not available.")
             return
+
+        # Get the extrinsic parameters from TF
+        extrinsic = self.get_extrinsic_from_tf()
 
         # environment settings
         torch.autocast(device_type=DEVICE, dtype=torch.float16).__enter__()
@@ -163,14 +208,7 @@ class ImageProcessor(Node):
             for mask in detections.mask:
                 masked_depth_image[mask] = self.depth_image[mask]
 
-            # TODO get camera extrinsic from ROS2
-            extrinsic = np.array([
-                [0.354,  0.935, -0.002, -0.044],
-                [0.538, -0.205, -0.817, -0.139],
-                [-0.765, 0.288, -0.576, 1.261],
-                [0.000,  0.000,  0.000, 1.000]
-            ], dtype=np.float64)
-
+            # Generate the point cloud using the intrinsic and extrinsic parameters
             pcd = o3d.geometry.PointCloud.create_from_depth_image(
                 o3d.geometry.Image(masked_depth_image), panda_intrinsic, extrinsic
             )
