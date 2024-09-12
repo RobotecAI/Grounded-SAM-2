@@ -19,7 +19,7 @@ from typing import Tuple
 from builtin_interfaces.msg import Time
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
- 
+from sensor_msgs.msg import CameraInfo
 
 """
 Hyper parameters
@@ -53,10 +53,15 @@ class ImageProcessor(Node):
         self.depth_subscription = self.create_subscription(
             RosImage, '/depth_image5', self.depth_callback, qos_profile)
 
+        # Subscribe to the camera info topic
+        self.camera_info_subscription = self.create_subscription(
+            CameraInfo, '/color_camera_info5', self.camera_info_callback, qos_profile)
+
         # Image processing utilities
         self.bridge = CvBridge()
         self.color_image = None
         self.depth_image = None
+        self.camera_info = None
         self.last_processed_time = self.get_clock().now()
 
         # SAM2 and Grounding DINO setup
@@ -65,26 +70,50 @@ class ImageProcessor(Node):
 
         self.processor = AutoProcessor.from_pretrained(GROUNDING_MODEL)
         self.grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_MODEL).to(DEVICE)
-    
+
+    def camera_info_callback(self, msg: CameraInfo):
+        """Callback function for camera info topic."""
+        self.camera_info = msg
+
+    def get_intrinsic_from_camera_info(self):
+        """Extract camera intrinsic parameters from the CameraInfo message."""
+        if self.camera_info is None:
+            return None
+        
+        width = self.camera_info.width
+        height = self.camera_info.height
+        fx = self.camera_info.k[0]  # Focal length in x-axis
+        fy = self.camera_info.k[4]  # Focal length in y-axis
+        cx = self.camera_info.k[2]  # Principal point x
+        cy = self.camera_info.k[5]  # Principal point y
+        
+        return o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+
     def color_callback(self, msg):
         current_time = self.get_clock().now()
         if (current_time - self.last_processed_time).nanoseconds * 1e-9 < PROCESSING_INTERVAL_SEC:
             return  # Skip processing if within the throttling interval
 
         self.color_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgba8')
-        if self.color_image is not None and self.depth_image is not None:
+        if self.color_image is not None and self.depth_image is not None and self.camera_info is not None:
             self.process_images()
             self.last_processed_time = current_time
 
     def depth_callback(self, msg):
         self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
 
-
     def process_images(self):
         """Process the color and depth images for object detection and point cloud generation."""
         # Grounding DINO inference
         image_pil = Image.fromarray(self.color_image)
         image_pil = image_pil.convert("RGB")
+
+        # Get the intrinsic parameters from camera info
+        panda_intrinsic = self.get_intrinsic_from_camera_info()
+        if panda_intrinsic is None:
+            self.get_logger().warn("Camera intrinsic parameters not available.")
+            return
+
         # environment settings
         torch.autocast(device_type=DEVICE, dtype=torch.float16).__enter__()
 
@@ -133,8 +162,7 @@ class ImageProcessor(Node):
             masked_depth_image = np.zeros_like(self.depth_image, dtype=np.float32)
             for mask in detections.mask:
                 masked_depth_image[mask] = self.depth_image[mask]
-                # TODO read img size and camera intrinsic params from ROS2 messages
-            panda_intrinsic = o3d.camera.PinholeCameraIntrinsic(512, 512, 401.84, 401.84, 256.0, 256.0)
+
             # TODO get camera extrinsic from ROS2
             extrinsic = np.array([
                 [0.354,  0.935, -0.002, -0.044],
@@ -158,11 +186,9 @@ class ImageProcessor(Node):
 
             # Publish centroid
             self.publish_centroid(centroid)
-            # o3d.visualization.draw_geometries([filtered_pcd])
             del inputs, outputs, results, masks, scores, logits, input_boxes
         else:
-            print("No detections found.")
-        
+            self.get_logger().info("No detections found.")
 
     def publish_centroid(self, centroid):
         msg = Float32MultiArray()
