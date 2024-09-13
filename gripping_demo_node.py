@@ -224,14 +224,14 @@ class ImageProcessor(Node):
                 # Calculate central point in XY plane and highest Z point for TARGET
                 xy_center = np.mean(points[:, :2], axis=0)  # Mean of x and y coordinates
                 max_z = np.max(points[:, 2])  # Maximum of z coordinates
-                centroid = np.array([xy_center[0], xy_center[1], max_z + 0.2])
+                centroid = np.array([xy_center[0], xy_center[1], max_z + 0.1])
                 self.get_logger().info(f'Calculated central XY and highest Z for TARGET: {centroid}')
                 gripper_state = 1.0
             z = 0.0
             state = np.array([centroid[0], centroid[1], centroid[2], z, gripper_state])
             # Publish the calculated centroid
             self.publish_state(state)
-            o3d.visualization.draw_geometries([filtered_pcd])
+            # o3d.visualization.draw_geometries([filtered_pcd])
         else:
             if self.is_processing_object:
                 # If no OBJECT was found, set object_detected to False
