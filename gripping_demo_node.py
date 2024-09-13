@@ -175,8 +175,8 @@ class ImageProcessor(Node):
             results = self.processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
-                box_threshold=0.5,
-                text_threshold=0.7,
+                box_threshold=0.3,
+                text_threshold=0.3,
                 target_sizes=[image_pil.size[::-1]]
             )
 
@@ -200,8 +200,8 @@ class ImageProcessor(Node):
             )
 
             masked_depth_image = np.zeros_like(self.depth_image, dtype=np.float32)
-            for mask in detections.mask:
-                masked_depth_image[mask] = self.depth_image[mask]
+            mask = detections.mask[0]
+            masked_depth_image[mask] = self.depth_image[mask]
 
             pcd = o3d.geometry.PointCloud.create_from_depth_image(
                 o3d.geometry.Image(masked_depth_image), panda_intrinsic, extrinsic
