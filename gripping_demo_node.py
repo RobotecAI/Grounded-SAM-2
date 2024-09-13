@@ -24,6 +24,7 @@ import tf2_ros
 import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
 from scipy.spatial.transform import Rotation as R
+from geometry_msgs.msg import Pose, PoseStamped
 
 """
 Hyper parameters
@@ -81,6 +82,9 @@ class ImageProcessor(Node):
         # Flag to alternate between processing OBJECT and TARGET
         self.is_processing_object = True
         self.object_detected = False
+        self.offset_x = 0.015
+        self.offset_y= -0.015
+        self.offset_z = 0.08  
 
     def camera_info_callback(self, msg: CameraInfo):
         """Callback function for camera info topic."""
@@ -175,8 +179,8 @@ class ImageProcessor(Node):
             results = self.processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
-                box_threshold=0.3,
-                text_threshold=0.3,
+                box_threshold=0.4,
+                text_threshold=0.5,
                 target_sizes=[image_pil.size[::-1]]
             )
 
@@ -213,11 +217,43 @@ class ImageProcessor(Node):
 
             points = np.asarray(filtered_pcd.points)
 
+            # Determine if processing OBJECT or TARGET
             if self.is_processing_object:
+                grasp_z = points[:, 2].max()
+                near_grasp_z_points = points[points[:, 2] > grasp_z - 0.008]
+                xy_points = near_grasp_z_points[:, :2]
+                xy_points = xy_points.astype(np.float32)
+                center, dimensions, theta = cv2.minAreaRect(xy_points)
+
+                gripper_rotation = theta
+                # NOTE  - estimated dimentsion from the RGBDCamera5 not very precise, what may cause not desired rotation 
+                if dimensions[0] > dimensions[1]:
+                    gripper_rotation -= 90
+                if gripper_rotation < -90:
+                    gripper_rotation += 180
+                elif gripper_rotation > 90:
+                    gripper_rotation -= 180
+
+                # gripper_opening = min(dimensions)
+                # grasp_pose = Pose()
+                # grasp_pose.position.x = center[0] + self.offset_x
+                # grasp_pose.position.y = center[1] + self.offset_y
+                # grasp_pose.position.z = grasp_z + self.offset_z
+                # top_down_rot = R.from_quat([0, 1, 0, 0])
+                # extra_rot = R.from_euler("z", gripper_rotation, degrees=True)
+                # grasp_quat = (extra_rot * top_down_rot).as_quat()
+                # grasp_pose.orientation.x = grasp_quat[0]
+                # grasp_pose.orientation.y = grasp_quat[1]
+                # grasp_pose.orientation.z = grasp_quat[2]
+                # grasp_pose.orientation.w = grasp_quat[3]
+
+                z_rot = gripper_rotation
                 # Calculate full 3D centroid for OBJECT
                 centroid = np.mean(points, axis=0)
+                # TODO : change offset to be dependant on the height of the object
                 centroid[2] += 0.1  # Added a small offset to prevent gripper collision
                 self.get_logger().info(f'Calculated 3D centroid for OBJECT: {centroid}')
+
                 self.object_detected = True
                 gripper_state = 0.0
             else:
@@ -227,8 +263,10 @@ class ImageProcessor(Node):
                 centroid = np.array([xy_center[0], xy_center[1], max_z + 0.1])
                 self.get_logger().info(f'Calculated central XY and highest Z for TARGET: {centroid}')
                 gripper_state = 1.0
-            z = 0.0
-            state = np.array([centroid[0], centroid[1], centroid[2], z, gripper_state])
+                z_rot = 0.0
+            self.get_logger().info(f'Gripper rotation: {z_rot}')
+            state = np.array([centroid[0], centroid[1], centroid[2], z_rot, gripper_state])
+
             # Publish the calculated centroid
             self.publish_state(state)
             # o3d.visualization.draw_geometries([filtered_pcd])
