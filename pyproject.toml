@@ -7,12 +7,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 #package name rai-sam2 is taken on Test PyPi
-name = "rai-grounded-sam2"
-version = "1.1.1"
+name = "rai-sam2"
+version = "1.1.2"
 description = "SAM 2: Segment Anything in Images and Videos (RobotecAI fork)"
 authors = [
     {name = "Meta AI", email = "segment-anything@meta.com"},
-    {name = "Maciej Majek", email = "maciej.majek@robotec.ai"}
+    {name = "Maciej Majek", email = "maciej.majek@robotec.ai"},
+    {name = "Bartłomiej Boczek", email = "bartlomiej.boczek@robotec.ai"}
 ]
 
 license = {text = "Apache-2.0"}
