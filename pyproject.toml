@@ -1,18 +1,18 @@
 [build-system]
 requires = [
-    "setuptools>=61.0",  
-    "torch>=2.3.1",
+    "setuptools>=61.0",
     ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rai-gsam2"
-version = "1.0.0"
-description = "SAM 2: Segment Anything in Images and Videos (RobotecAI fork)"
+version = "1.1.2"
+description = "Grounded SAM 2: Ground and Track Anything in Videos (RobotecAI fork)"
 authors = [
     {name = "Meta AI", email = "segment-anything@meta.com"},
     {name = "Maciej Majek", email = "maciej.majek@robotec.ai"},
-    {name = "Bartłomiej Boczek", email = "bartlomiej.boczek@robotec.ai"}
+    {name = "Bartłomiej Boczek", email = "bartlomiej.boczek@robotec.ai"},
+    {name = "Julia Jia", email = "juliajster@gmail.com"}
 ]
 
 license = {text = "Apache-2.0"}
