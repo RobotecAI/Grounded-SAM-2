@@ -8,6 +8,7 @@ import os
 import warnings
 from threading import Thread
 
+from typing import Tuple
 import numpy as np
 import torch
 from PIL import Image
@@ -179,6 +180,115 @@ def load_video_frames(
     compute_device=torch.device("cuda"),
 ):
     """
+    Load the video frames from video_path. The frames are resized to image_size as in
+    the model and are loaded to GPU if offload_video_to_cpu=False. This is used by the demo.
+    """
+    is_bytes = isinstance(video_path, bytes)
+    is_str = isinstance(video_path, str)
+    is_mp4_path = is_str and os.path.splitext(video_path)[-1] in [".mp4", ".MP4"]
+    if is_bytes or is_mp4_path:
+        return load_video_frames_from_video_file(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            compute_device=compute_device,
+        )
+    elif is_str and os.path.isdir(video_path):
+        return load_video_frames_from_jpg_images(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            async_loading_frames=async_loading_frames,
+            compute_device=compute_device,
+        )
+    else:
+        raise NotImplementedError(
+            "Only MP4 video and JPEG folder are supported at this moment"
+        )
+
+def process_stream_frame(
+    img_array: np.ndarray,
+    image_size: int,
+    img_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+    img_std:  Tuple[float, float, float] = (0.229, 0.224, 0.225),
+    offload_to_cpu: bool = False,
+    compute_device: torch.device = torch.device("cuda"),
+):
+    """
+    Convert a raw image array (H,W,3 or 3,H,W) into a model‑ready tensor.
+    Steps
+    -----
+    1. Resize the shorter side to `image_size`, keeping aspect ratio,
+       then center‑crop/pad to `image_size` × `image_size`.
+    2. Change layout to [3, H, W] and cast to float32 in [0,1].
+    3. Normalise with ImageNet statistics.
+    4. Optionally move to `compute_device`.
+    Returns
+    -------
+    img_tensor : torch.FloatTensor  # shape [3, image_size, image_size]
+    orig_h     : int
+    orig_w     : int
+    """
+
+    # ↪ uses your existing helper so behaviour matches the batch loader
+    img_tensor, orig_h, orig_w = _resize_and_convert_to_tensor(img_array, image_size)
+
+    # Normalisation (done *after* potential device move for efficiency)
+    img_mean_t = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std_t  = torch.tensor(img_std,  dtype=torch.float32)[:, None, None]
+
+    if not offload_to_cpu:
+        img_tensor = img_tensor.to(compute_device)
+        img_mean_t = img_mean_t.to(compute_device)
+        img_std_t  = img_std_t.to(compute_device)
+
+    img_tensor.sub_(img_mean_t).div_(img_std_t)
+
+    return img_tensor, orig_h, orig_w
+
+
+def _resize_and_convert_to_tensor(img_array, image_size):
+    """
+    Resize the input image array and convert it into a tensor.
+    Also return original image height and width.
+    """
+    # Convert numpy array to PIL image and ensure RGB
+    img_pil = Image.fromarray(img_array).convert("RGB")
+
+    # Save original size (PIL: size = (width, height))
+    video_width, video_height = img_pil.size
+
+    # Resize with high-quality LANCZOS filter
+    img_resized = img_pil.resize((image_size, image_size), Image.Resampling.LANCZOS)
+
+    # Convert resized image back to numpy and then to float tensor
+    img_resized_array = np.array(img_resized)
+
+    if img_resized_array.dtype == np.uint8:
+        img_resized_array = img_resized_array / 255.0
+    else:
+        raise RuntimeError(f"Unexpected dtype: {img_resized_array.dtype}")
+
+    # Convert to PyTorch tensor and permute to [C, H, W]
+    img_tensor = torch.from_numpy(img_resized_array).permute(2, 0, 1)
+
+    return img_tensor, video_height, video_width
+
+
+def load_video_frames_from_jpg_images(
+    video_path,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    async_loading_frames=False,
+    compute_device=torch.device("cuda"),
+):
+    """
     Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
 
     The frames are resized to image_size x image_size and are loaded to GPU if
@@ -236,6 +346,38 @@ def load_video_frames(
     return images, video_height, video_width
 
 
+def load_video_frames_from_video_file(
+    video_path,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """Load the video frames from a video file."""
+    import decord
+
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+    # Get the original video height and width
+    decord.bridge.set_bridge("torch")
+    video_height, video_width, _ = decord.VideoReader(video_path).next().shape
+    # Iterate over all frames in the video
+    images = []
+    for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
+        images.append(frame.permute(2, 0, 1))
+
+    images = torch.stack(images, dim=0).float() / 255.0
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+    # normalize by mean and std
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+
+
 def fill_holes_in_mask_scores(mask, max_area):
     """
     A post processor to fill small holes in mask scores with area under `max_area`.
@@ -256,7 +398,7 @@ def fill_holes_in_mask_scores(mask, max_area):
             f"{e}\n\nSkipping the post-processing step due to the error above. You can "
             "still use SAM 2 and it's OK to ignore the error above, although some post-processing "
             "functionality may be limited (which doesn't affect the results in most cases; see "
-            "https://github.com/facebookresearch/segment-anything-2/blob/main/INSTALL.md).",
+            "https://github.com/facebookresearch/sam2/blob/main/INSTALL.md).",
             category=UserWarning,
             stacklevel=2,
         )

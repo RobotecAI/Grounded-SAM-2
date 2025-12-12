@@ -1,15 +1,13 @@
-# dds cloudapi for Grounding DINO 1.5
+# dds cloudapi for Grounding DINO 1.5 - update to V2Task API
 from dds_cloudapi_sdk import Config
 from dds_cloudapi_sdk import Client
-from dds_cloudapi_sdk import DetectionTask
-from dds_cloudapi_sdk import TextPrompt
-from dds_cloudapi_sdk import DetectionModel
-from dds_cloudapi_sdk import DetectionTarget
+from dds_cloudapi_sdk.tasks.v2_task import V2Task
 
 import os
 import cv2
 import json
 import torch
+import tempfile
 import numpy as np
 import supervision as sv
 import pycocotools.mask as mask_util
@@ -24,9 +22,14 @@ Hyper parameters
 API_TOKEN = "Your API token"
 TEXT_PROMPT = "car . building ."
 IMG_PATH = "notebooks/images/cars.jpg"
-SAM2_CHECKPOINT = "./checkpoints/sam2_hiera_large.pt"
-SAM2_MODEL_CONFIG = "sam2_hiera_l.yaml"
-GROUNDING_MODEL = DetectionModel.GDino1_5_Pro # DetectionModel.GDino1_6_Pro
+SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
+SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+GROUNDING_MODEL = "GroundingDino-1.5-Pro"  # GroundingDino-1.6-Pro
+BOX_THRESHOLD = 0.2
+IOU_THRESHOLD = 0.8
+WITH_SLICE_INFERENCE = False
+SLICE_WH = (480, 480)
+OVERLAP_RATIO = (0.2, 0.2)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = Path("outputs/grounded_sam2_gd1.5_demo")
 DUMP_JSON_RESULTS = True
@@ -44,35 +47,105 @@ config = Config(token)
 # Step 2: initialize the client
 client = Client(config)
 
-# Step 3: run the task by DetectionTask class
-# image_url = "https://algosplt.oss-cn-shenzhen.aliyuncs.com/test_files/tasks/detection/iron_man.jpg"
+# Step 3: run the task using V2Task API
 # if you are processing local image file, upload them to DDS server to get the image url
-img_path = IMG_PATH
-image_url = client.upload_file(img_path)
 
-task = DetectionTask(
-    image_url=image_url,
-    prompts=[TextPrompt(text=TEXT_PROMPT)],
-    targets=[DetectionTarget.BBox],  # detect bbox
-    model=GROUNDING_MODEL,  # detect with GroundingDino-1.5-Pro model
-)
+classes = [x.strip().lower() for x in TEXT_PROMPT.split('.') if x]
+class_name_to_id = {name: id for id, name in enumerate(classes)}
+class_id_to_name = {id: name for name, id in class_name_to_id.items()}
 
-client.run_task(task)
-result = task.result
+if WITH_SLICE_INFERENCE:
+    def callback(image_slice: np.ndarray) -> sv.Detections:
+        print("Inference on image slice")
+        # save the img as temp img file for GD-1.5 API usage
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmpfile:
+            temp_filename = tmpfile.name
+        cv2.imwrite(temp_filename, image_slice)
+        image_url = client.upload_file(temp_filename)
+        task = V2Task(
+            api_path="/v2/task/grounding_dino/detection",
+            api_body={
+                "model": GROUNDING_MODEL,
+                "image": image_url,
+                "prompt": {
+                    "type": "text",
+                    "text": TEXT_PROMPT
+                },
+                "targets": ["bbox"],
+                "bbox_threshold": BOX_THRESHOLD,
+                "iou_threshold": IOU_THRESHOLD,
+            }
+        )
+        client.run_task(task)
+        result = task.result
+        # delete the tempfile
+        os.remove(temp_filename)
+        
+        input_boxes = []
+        confidences = []
+        class_ids = []
+        objects = result["objects"]
+        for idx, obj in enumerate(objects):
+            input_boxes.append(obj["bbox"])
+            confidences.append(obj["score"])
+            cls_name = obj["category"].lower().strip()
+            class_ids.append(class_name_to_id[cls_name])
+        # ensure input_boxes with shape (_, 4)
+        input_boxes = np.array(input_boxes).reshape(-1, 4)
+        class_ids = np.array(class_ids)
+        confidences = np.array(confidences)
+        return sv.Detections(xyxy=input_boxes, confidence=confidences, class_id=class_ids)
+    
+    slicer = sv.InferenceSlicer(
+        callback=callback,
+        slice_wh=SLICE_WH,
+        overlap_ratio_wh=OVERLAP_RATIO,
+        iou_threshold=IOU_THRESHOLD,
+        overlap_filter_strategy=sv.OverlapFilter.NON_MAX_SUPPRESSION
+        )
+    detections = slicer(cv2.imread(IMG_PATH))
+    class_names = [class_id_to_name[id] for id in detections.class_id]
+    confidences = detections.confidence
+    class_ids = detections.class_id
+    input_boxes = detections.xyxy
+else:
+    image_url = client.upload_file(IMG_PATH)
 
-objects = result.objects  # the list of detected objects
+    task = V2Task(
+        api_path="/v2/task/grounding_dino/detection",
+        api_body={
+            "model": GROUNDING_MODEL,
+            "image": image_url,
+            "prompt": {
+                "type": "text",
+                "text": TEXT_PROMPT
+            },
+            "targets": ["bbox"],
+            "bbox_threshold": BOX_THRESHOLD,
+            "iou_threshold": IOU_THRESHOLD,
+        }
+    )
+
+    client.run_task(task)
+    result = task.result
+
+    objects = result["objects"]  # the list of detected objects
 
 
-input_boxes = []
-confidences = []
-class_names = []
+    input_boxes = []
+    confidences = []
+    class_names = []
+    class_ids = []
 
-for idx, obj in enumerate(objects):
-    input_boxes.append(obj.bbox)
-    confidences.append(obj.score)
-    class_names.append(obj.category)
+    for idx, obj in enumerate(objects):
+        input_boxes.append(obj["bbox"])
+        confidences.append(obj["score"])
+        cls_name = obj["category"].lower().strip()
+        class_names.append(cls_name)
+        class_ids.append(class_name_to_id[cls_name])
 
-input_boxes = np.array(input_boxes)
+    input_boxes = np.array(input_boxes)
+    class_ids = np.array(class_ids)
 
 """
 Init SAM 2 Model and Predict Mask with Box Prompt
@@ -93,7 +166,7 @@ model_cfg = SAM2_MODEL_CONFIG
 sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=DEVICE)
 sam2_predictor = SAM2ImagePredictor(sam2_model)
 
-image = Image.open(img_path)
+image = Image.open(IMG_PATH)
 
 sam2_predictor.set_image(np.array(image.convert("RGB")))
 
@@ -117,8 +190,6 @@ if masks.ndim == 4:
 Visualization the Predict Results
 """
 
-class_ids = np.array(list(range(len(class_names))))
-
 labels = [
     f"{class_name} {confidence:.2f}"
     for class_name, confidence
@@ -128,7 +199,7 @@ labels = [
 """
 Visualize image with supervision useful API
 """
-img = cv2.imread(img_path)
+img = cv2.imread(IMG_PATH)
 detections = sv.Detections(
     xyxy=input_boxes,  # (n, 4)
     mask=masks.astype(bool),  # (n, h, w)
@@ -146,6 +217,8 @@ mask_annotator = sv.MaskAnnotator()
 annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
 cv2.imwrite(os.path.join(OUTPUT_DIR, "grounded_sam2_annotated_image_with_mask.jpg"), annotated_frame)
 
+print(f'Annotated image has already been saved as to "{OUTPUT_DIR}"')
+
 """
 Dump the results in standard format and save as json files
 """
@@ -156,6 +229,7 @@ def single_mask_to_rle(mask):
     return rle
 
 if DUMP_JSON_RESULTS:
+    print("Start dumping the annotation...")
     # convert mask into rle format
     mask_rles = [single_mask_to_rle(mask) for mask in masks]
 
@@ -165,7 +239,7 @@ if DUMP_JSON_RESULTS:
     class_names = [class_name.strip() for class_name in class_names]
     # save the results in standard format
     results = {
-        "image_path": img_path,
+        "image_path": IMG_PATH,
         "annotations" : [
             {
                 "class_name": class_name,
@@ -182,3 +256,5 @@ if DUMP_JSON_RESULTS:
     
     with open(os.path.join(OUTPUT_DIR, "grounded_sam2_gd1.5_image_demo_results.json"), "w") as f:
         json.dump(results, f, indent=4)
+
+    print(f'Annotation has already been saved to "{OUTPUT_DIR}"')
